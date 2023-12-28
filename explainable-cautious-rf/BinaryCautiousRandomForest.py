@@ -167,6 +167,8 @@ class WCRF:
     def predict(self, X, plot=False):
         count = 0
         # intitialize prediciton list
+        if X.ndim==1:
+            X = X.reshape((1,-1))
         predictions = np.zeros(len(X))
         pred_intervals = []
         p_intervals = []
