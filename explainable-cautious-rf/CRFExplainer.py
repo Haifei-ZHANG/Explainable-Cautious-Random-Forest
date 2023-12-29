@@ -9,9 +9,7 @@ import numpy as np
 import pandas as pd
 import time
 import copy
-from math import ceil, floor
 from sklearn.neighbors import LocalOutlierFactor
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 from BinaryCautiousRandomForest import WCRF
 
@@ -31,14 +29,23 @@ class CRFCFExplainer:
         self.decreasing_features = feature_cons['decreasing']
         self.feature_types = feature_cons['data types']
         self.dist_type = dist_type
+        self.epsilon = 1e-4
+        self.lof = LocalOutlierFactor(n_neighbors=5, novelty=True)
         
 
     def fit(self):
+        # get feature importance to determin feature order
+        feature_importance = self.rf.feature_importances_
+        self.feature_order = np.argsort(feature_importance)
+        
         # calculate the distance adjustment terms
         self.dist_std = np.std(self.train_set, axis=0)
         medians_abs_diff = abs(self.train_set - np.median(self.train_set, axis=0))
         self.dist_mad = np.mean(medians_abs_diff, axis=0)
         self.dist_mad[self.dist_mad==0] = 1
+        
+        # train the local outlier factor
+        self.lof.fit(self.train_set)
         
         # extract decision rules [decision paths, probabilityies]
         # extract split values and split intervals
@@ -120,12 +127,34 @@ class CRFCFExplainer:
      
     def __instance_dist(self, x, X, dist_type):
         if dist_type == 'L1':
-            dist = (abs(X - x)/self.dist_mad).sum(axis=1)
+            dists = (abs(X - x)/self.dist_mad).sum(axis=1)
         elif dist_type == 'L0':
-            dist = (X != x).sum(axis=1)
+            dists = (X != x).sum(axis=1)
         else:
-            dist = np.sqrt(((X - x)**2/self.dist_std).sum(axis=1))
-        return dist
+            dists = np.sqrt(((X - x)**2/self.dist_std).sum(axis=1))
+        return dists
+    
+    
+    def __interval_dist(self, d, x_d, intervals, dist_type):
+        in_index = (intervals[:,0] < x_d) * (x_d <= intervals[:,1])
+        left_index = intervals[:,1] < x_d
+        right_index = intervals[:,0] >= x_d
+        dists = np.zeros(len(intervals))
+        dists[in_index] = 0
+        if self.feature_types[d] == 'int':
+            dists[left_index] = x_d - np.floor(intervals[left_index,1])
+            dists[right_index] = np.ceil(intervals[right_index,1] + self.epsilon) - x_d
+        else:
+            dists[left_index] = x_d - intervals[left_index,1]
+            dists[right_index] = intervals[right_index,1] - x_d + self.epsilon
+        if dist_type == 'L1':
+            dists = dists/self.dist_mad[d]
+        elif dist_type == 'L0':
+            dists = (dists!=0)*1
+        else:
+            dists = dists**2/self.dist_std[d] # not squared
+        
+        return dists
     
     
     def __generate_cf_in_regions(self, x, regions):
@@ -134,10 +163,10 @@ class CRFCFExplainer:
             take_inf = regions[:,2*d] >= x[d]
             take_sup = regions[:,2*d+1] < x[d]
             if self.feature_types[d] == 'int':
-                inf_values = np.ceil(regions[take_inf,2*d] + 1e-4)
+                inf_values = np.ceil(regions[take_inf,2*d] + self.epsilon)
                 sup_values = np.floor(regions[take_sup,2*d+1])
             else:
-                inf_values = regions[take_inf,2*d] + 1e-4
+                inf_values = regions[take_inf,2*d] + self.epsilon
                 sup_values = regions[take_sup,2*d+1]
             
             candidates[take_inf,d] = inf_values
@@ -187,6 +216,20 @@ class CRFCFExplainer:
         cf = remain_instances[cf_index]
         
         return cf, round(min_dist,4)
+    
+    
+    def discern(self, x, target, dist_type=None):
+        init_cf, init_min_dist = self.mo(x, target, dist_type)
+        cf = x.copy()
+        if init_cf is None:
+            return init_cf, init_min_dist
+        else:
+            for d in self.feature_order:
+                cf[d] = init_cf[d]
+                prediction = self.model.predict(cf.reshape((1,-1)))[0]
+                if prediction ==  target:
+                    min_dist = self.__instance_dist(x, cf.reshape((1,-1)), dist_type)[0]
+                    return cf, round(min_dist, 4)
         
 
     def ofcc(self, x, target, dist_type=None):
@@ -210,9 +253,9 @@ class CRFCFExplainer:
                     split_points_d = split_points_d[split_points_d > x[d]]
                     candidates = x.reshape((1,-1)).repeat(len(split_points_d), axis=0)
                     if self.feature_types[d] == 'int':
-                        candidates[:,d] = np.ceil(split_points_d + 1e-4)
+                        candidates[:,d] = np.ceil(split_points_d + self.epsilon)
                     else: 
-                        candidates[:,d] = split_points_d + 1e-4
+                        candidates[:,d] = split_points_d + self.epsilon
             elif self.decreasing_features is not None:
                 if feature in self.decreasing_features:
                     split_points_d = split_points_d[split_points_d < x[d]]
@@ -226,10 +269,10 @@ class CRFCFExplainer:
                 index1 = split_points_d > x[d]
                 index2 = split_points_d < x[d]
                 if self.feature_types[d] == 'int':
-                    candidates[index1,d] = np.ceil(split_points_d[index1] + 1e-4)
+                    candidates[index1,d] = np.ceil(split_points_d[index1] + self.epsilon)
                     candidates[index2,d] = np.floor(split_points_d[index2])
                 else:
-                    candidates[index1,d] = split_points_d[index1] + 1e-4
+                    candidates[index1,d] = split_points_d[index1] + self.epsilon
                     candidates[index2,d] = split_points_d[index2]
             
             predictions = self.model.predict(candidates)
@@ -252,16 +295,15 @@ class CRFCFExplainer:
             return None, None
         else:
             return cf, round(min_dist,4)
-        
-    
-    def discern(self, x, target, dist_type=None):
-        pass
             
     
     def lire(self, x, target, dist_type=None):
         if target not in self.classes:
             print("Your input target dose not existe!")
             return None, None
+        
+        if dist_type is None and self.dist_type is None:
+            dist_type = 'L1'
         
         live_regions = self.live_regions[self.live_regions_predictions==target].copy()
         
@@ -301,6 +343,13 @@ class CRFCFExplainer:
     
     
     def eece(self, x, target, dist_type=None):
+        if target not in self.classes:
+            print("Your input target dose not existe!")
+            return None, None
+        
+        if dist_type is None and self.dist_type is None:
+            dist_type = 'L1'
+            
         regions = np.concatenate((self.decision_paths.copy(), self.live_regions.copy()), axis=0)
         for d in range(self.n_features):
             feature = self.feature_names[d]
@@ -340,6 +389,146 @@ class CRFCFExplainer:
                 cf = candidates[cf_index]
                 
                 return cf, round(min_dist,4)
+    
+            
+    def __filter_split_intervals(self, x, init_dist, dist_type):
+        split_intervals = copy.deepcopy(self.split_intervals)
+        n_intervals = np.zeros(self.n_features)
+        split_interval_dists = {}
+        for d in range(self.n_features):
+            feature = self.feature_names[d]
+            split_intervals_d = split_intervals[d]
+            
+            if self.immutable_features is not None:
+                if feature in self.immutable_features:
+                    index = (split_intervals_d[:,0] < x[d]) * (x[d] <= split_intervals_d[:,1])
+                    split_intervals[d] = split_intervals_d[index]
+                    n_intervals[d] = 1
+                    continue
+            elif self.increasing_features is not None:
+                if feature in self.increasing_features:
+                    index = split_intervals_d[:,1] >= x[d]
+                    split_intervals_d = split_intervals_d[index]
+                    
+                    dists = self.__interval_dist(d, x[d], split_intervals_d, dist_type)
+                    interval_order = np.argsort(dists)
+                    dists = dists[interval_order]
+                    split_intervals_d = split_intervals_d[interval_order]
+                    
+                    index = dists <= init_dist
+                    n_intervals[d] = sum(index)
+                    split_interval_dists[d] = dists[index]
+                    split_intervals[d] = split_intervals_d[index]
+                    continue
+            elif self.decreasing_features is not None:
+                if feature in self.decreasing_features:
+                    index = split_intervals_d[:,0] < x[d]
+                    split_intervals_d = split_intervals_d[index]
+                    
+                    dists = self.__interval_dist(d, x[d], split_intervals_d, dist_type)
+                    interval_order = np.argsort(dists)
+                    dists = dists[interval_order]
+                    split_intervals_d = split_intervals_d[interval_order]
+                    
+                    index = dists <= init_dist
+                    n_intervals[d] = sum(index)
+                    split_interval_dists[d] = dists[index]
+                    split_intervals[d] = split_intervals_d[index]
+                    continue
+            else:
+                dists = self.__interval_dist(d, x[d], split_intervals_d, dist_type)
+                interval_order = np.argsort(dists)
+                dists = dists[interval_order]
+                split_intervals_d = split_intervals_d[interval_order]
+                
+                index = dists <= init_dist
+                n_intervals[d] = sum(index)
+                split_interval_dists[d] = dists[index]
+                split_intervals[d] = split_intervals_d[index]
+        
+        return split_intervals, split_interval_dists, n_intervals
+    
+    
+    def exact_cf(self,  x, target, dist_type=None):
+        if target not in self.classes:
+            print("Your input target dose not existe!")
+            return None, None
+        
+        if dist_type is None and self.dist_type is None:
+            dist_type = 'L1'
+            
+        init_cf, init_dist = self.eece(x, target, dist_type)
+        if dist_type == 'L2':
+            init_dist = init_dist ** 2
+        if init_dist is not None:
+            # filter split intervals
+            split_intervals, split_interval_dists, n_intervals = self.__filter_split_intervals(x, init_dist, dist_type)
+        else:
+            print("Your feature constrains are too strict for this instance! Can't generate satisfied counterfactual example!")
+            return None, None
+
+        n_checked_intervals = np.zeros(self.n_features, 'int64')
+        current_level = 0
+        current_region = np.zeros(2*self.n_features)
+        feature_dists= np.zeros(self.n_features)
+        leaf_index = {}
+        cf = init_cf.copy()
+        min_dist = copy.deepcopy(init_dist)
+        start_time = time.time()
+        while True:
+            end_time = time.time()
+            d = self.feature_order[current_level]
+            if current_level < 0 or (end_time - start_time) > 10:
+                if dist_type=='L2':
+                    min_dist = np.sqrt(min_dist)
+                return cf, round(min_dist,4)
+            elif n_checked_intervals[d]==n_intervals[d]:
+                n_checked_intervals[d] = 0
+                feature_dists[d] = 0
+                current_level -= 1
+            else:
+                feature_dists[d] = split_interval_dists[d][n_checked_intervals[d]]
+                
+                # confirm cumulative distance
+                if sum(feature_dists) >= min_dist:
+                    n_checked_intervals[d] = 0
+                    feature_dists[d] = 0
+                    current_level -= 1
+                else:
+                    interval = split_intervals[d][n_checked_intervals[d]]
+                    interval_key = (interval[0],interval[1])
+                    n_checked_intervals[d] += 1
+                    current_region[2*d:2*d+2] = interval
+                    
+                    # calculate leaf index
+                    if current_level == 0:
+                        leaf_index[current_level] = self.intervals_with_leaves[d][interval_key]
+                    else:
+                        leaf_index[current_level] = np.intersect1d(leaf_index[current_level-1], 
+                                                                   self.intervals_with_leaves[d][interval_key])
+                    # check if arrived in a leaf
+                    if current_level == self.n_features-1:
+                        prbability_intervals = self.probability_intervals[leaf_index[current_level]]
+                        probabilities_aggr = np.zeros_like(prbability_intervals, dtype='bool')
+                        probabilities_aggr[:,:2*self.n_classes:2] = prbability_intervals[:,:2*self.n_classes:2] >= 0.5
+                        probabilities_aggr[:,1:2*self.n_classes:2] = prbability_intervals[:,1:2*self.n_classes:2] > 0.5
+                        probabilities_aggr = np.mean(probabilities_aggr,axis=0)
+                        if probabilities_aggr[2] >= 0.5:
+                            current_prediction = 1
+                        elif probabilities_aggr[3] <= 0.5:
+                            current_prediction = 0
+                        else:
+                            current_prediction = -1
+                        
+                        # check if reach target
+                        if current_prediction == target:
+                            candidate = self.__generate_cf_in_regions(x, current_region.reshape((1,-1)))
+                            # check plausibility
+                            if self.lof.predict(candidate)[0] == 1:
+                                cf = candidate[0]
+                                min_dist = sum(feature_dists)
+                    else:
+                        current_level += 1
         
         
                 
@@ -356,7 +545,7 @@ if __name__ == "__main__":
     X = np.array(data.iloc[:,:-1])
     y = np.array(data.iloc[:,-1]) 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
-    wcrf = WCRF(n_trees=10, s=3, gamma=10, labda=10, tree_max_depth=7, combination=1)
+    wcrf = WCRF(n_trees=50, s=3, gamma=10, labda=10, tree_max_depth=7, combination=1)
     wcrf.fit(X_train, y_train)
     predictions = wcrf.predict(X_test)
     indeterminate_index = np.where(predictions==-1)[0]
@@ -373,6 +562,14 @@ if __name__ == "__main__":
     cf, dist = explainer.mo(x, target,'L1')
     print(dist, wcrf.predict(cf))
     cf, dist = explainer.mo(x, target,'L2')
+    print(dist, wcrf.predict(cf))
+    
+    print("DisCERN")
+    cf, dist = explainer.discern(x, target,'L0')
+    print(dist, wcrf.predict(cf))
+    cf, dist = explainer.discern(x, target,'L1')
+    print(dist, wcrf.predict(cf))
+    cf, dist = explainer.discern(x, target,'L2')
     print(dist, wcrf.predict(cf))
     
     print("OFCC")
@@ -392,9 +589,17 @@ if __name__ == "__main__":
     print(dist, wcrf.predict(cf))
     
     print("EECE")
+    cf, dist = explainer.eece(x, target,'L0')
+    print(dist, wcrf.predict(cf))
     cf, dist = explainer.eece(x, target,'L1')
     print(dist, wcrf.predict(cf))
     cf, dist = explainer.eece(x, target,'L2')
     print(dist, wcrf.predict(cf))
-    cf, dist = explainer.eece(x, target,'L0')
+    
+    print("Exact CF")
+    cf, dist = explainer.exact_cf(x, target,'L0')
+    print(dist, wcrf.predict(cf))
+    cf, dist = explainer.exact_cf(x, target,'L1')
+    print(dist, wcrf.predict(cf))
+    cf, dist = explainer.exact_cf(x, target,'L2')
     print(dist, wcrf.predict(cf))
